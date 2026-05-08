@@ -1,11 +1,11 @@
-# SQL Server 备份工具
+# 数据库备份工具
 
-一个基于 Python `tkinter` 的桌面备份工具，适合快速配置 SQL Server 连接并执行数据库备份。
+一个基于 Python `tkinter` 的桌面备份工具，适合快速配置 SQL Server 或 MySQL 连接并执行数据库备份。
 
 ## 功能
 
 - 图形化界面
-- SQL Server 连接配置
+- SQL Server / MySQL 连接配置
 - Windows 认证 / SQL Server 认证
 - 数据库连接测试
 - 自动读取数据库列表
@@ -23,7 +23,8 @@
 
 - Windows
 - Python 3.10+
-- SQL Server ODBC Driver 17 或 18
+- SQL Server：SQL Server ODBC Driver 17 或 18
+- MySQL：MySQL 客户端工具，需可在命令行执行 `mysqldump`
 
 ## 安装依赖
 
@@ -54,14 +55,15 @@ python app.py
 
 ## 使用说明
 
-1. 填写服务器、端口和认证信息。
-2. 点击“读取数据库”获取数据库列表。
-3. 选择需要备份的数据库。
-4. 设置备份目录和备份文件名。
-5. 点击“测试连接”确认数据库可访问。
-6. 点击“开始备份”执行备份。
+1. 选择数据库类型：`SQL Server` 或 `MySQL`。
+2. 填写服务器/主机、端口和认证信息。
+3. 点击“读取数据库”获取数据库列表。
+4. 选择需要备份的数据库。
+5. 设置备份目录和备份文件名。
+6. 点击“测试连接”确认数据库可访问。
+7. 点击“开始备份”执行备份。
 
-如果不填写备份文件名，程序会自动按 `数据库名_时间戳.bak` 生成。
+如果不填写备份文件名，SQL Server 会自动按 `数据库名_时间戳.bak` 生成，MySQL 会自动按 `数据库名_时间戳.sql` 生成。
 
 ## 定时备份
 
@@ -101,5 +103,7 @@ dist\SQLServerBackupTool.exe
 
 ## 注意事项
 
-- 执行备份的账号需要具备 SQL Server 备份权限。
-- 如果遇到连接失败，请确认 SQL Server 已开启 TCP/IP、端口可访问，并已安装 ODBC 驱动。
+- 执行 SQL Server 备份的账号需要具备 SQL Server 备份权限。
+- 执行 MySQL 备份的账号需要具备读取目标库、表、视图、触发器、事件和存储过程的权限。
+- 如果遇到 SQL Server 连接失败，请确认 SQL Server 已开启 TCP/IP、端口可访问，并已安装 ODBC 驱动。
+- 如果遇到 MySQL 备份失败，请确认 `mysqldump` 已安装并加入 `PATH`。

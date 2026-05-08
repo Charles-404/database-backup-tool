@@ -1,5 +1,8 @@
 import json
+import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import winreg
@@ -15,6 +18,11 @@ try:
     import pyodbc
 except ImportError:  # pragma: no cover
     pyodbc = None
+
+try:
+    import pymysql
+except ImportError:  # pragma: no cover
+    pymysql = None
 
 try:
     import pystray
@@ -50,6 +58,7 @@ ICON_PNG_FILE = ASSETS_DIR / "app_icon.png"
 
 @dataclass
 class AppConfig:
+    db_type: str = "sqlserver"
     server: str = "localhost"
     port: str = "1433"
     database: str = ""
@@ -71,7 +80,7 @@ class AppConfig:
 class SqlServerBackupApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("SQL Server 备份工具")
+        self.root.title("数据库备份工具")
         self.root.geometry("1040x800")
         self.root.minsize(940, 740)
         self.apply_window_icon()
@@ -87,6 +96,7 @@ class SqlServerBackupApp:
         self.is_exiting = False
         self.tray_hint_shown = False
 
+        self.db_type_var = StringVar(value="sqlserver")
         self.server_var = StringVar()
         self.port_var = StringVar()
         self.database_var = StringVar()
@@ -111,6 +121,8 @@ class SqlServerBackupApp:
         self.schedule_interval_entry: ttk.Entry | None = None
         self.log_text: ScrolledText | None = None
         self.status_var = StringVar(value="就绪")
+        self.db_type_hint_label: ttk.Label | None = None
+        self.auth_frame: ttk.Frame | None = None
 
         self.build_ui()
         self.load_config(auto=True)
@@ -133,13 +145,13 @@ class SqlServerBackupApp:
 
         ttk.Label(
             header,
-            text="SQL Server 备份工具",
+            text="数据库备份工具",
             font=("Microsoft YaHei UI", 18, "bold"),
         ).grid(row=0, column=0, sticky="w")
 
         ttk.Label(
             header,
-            text="支持连接测试、手动备份、定时备份、托盘运行、开机自启动和托盘通知。",
+            text="支持 SQL Server 和 MySQL 的连接测试、手动备份、定时备份、托盘运行、开机自启动和托盘通知。",
             foreground="#555555",
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
@@ -155,46 +167,67 @@ class SqlServerBackupApp:
         config_card.columnconfigure(1, weight=1)
         config_card.columnconfigure(3, weight=1)
 
-        ttk.Label(config_card, text="服务器").grid(row=0, column=0, sticky=W, padx=(0, 8), pady=6)
-        ttk.Entry(config_card, textvariable=self.server_var).grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Label(config_card, text="数据库类型").grid(row=0, column=0, sticky=W, padx=(0, 8), pady=6)
+        type_frame = ttk.Frame(config_card)
+        type_frame.grid(row=0, column=1, columnspan=3, sticky="w", pady=6)
+        ttk.Radiobutton(
+            type_frame,
+            text="SQL Server",
+            value="sqlserver",
+            variable=self.db_type_var,
+            command=self.toggle_db_type,
+        ).pack(side=LEFT)
+        ttk.Radiobutton(
+            type_frame,
+            text="MySQL",
+            value="mysql",
+            variable=self.db_type_var,
+            command=self.toggle_db_type,
+        ).pack(side=LEFT, padx=(12, 0))
 
-        ttk.Label(config_card, text="端口").grid(row=0, column=2, sticky=W, padx=(12, 8), pady=6)
-        ttk.Entry(config_card, textvariable=self.port_var).grid(row=0, column=3, sticky="ew", pady=6)
+        ttk.Label(config_card, text="服务器/主机").grid(row=1, column=0, sticky=W, padx=(0, 8), pady=6)
+        ttk.Entry(config_card, textvariable=self.server_var).grid(row=1, column=1, sticky="ew", pady=6)
 
-        ttk.Label(config_card, text="数据库").grid(row=1, column=0, sticky=W, padx=(0, 8), pady=6)
+        ttk.Label(config_card, text="端口").grid(row=1, column=2, sticky=W, padx=(12, 8), pady=6)
+        ttk.Entry(config_card, textvariable=self.port_var).grid(row=1, column=3, sticky="ew", pady=6)
+
+        ttk.Label(config_card, text="数据库").grid(row=2, column=0, sticky=W, padx=(0, 8), pady=6)
         self.database_combo = ttk.Combobox(config_card, textvariable=self.database_var)
-        self.database_combo.grid(row=1, column=1, sticky="ew", pady=6)
+        self.database_combo.grid(row=2, column=1, sticky="ew", pady=6)
 
         ttk.Button(config_card, text="读取数据库", command=self.load_databases).grid(
-            row=1, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=6
+            row=2, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=6
         )
 
-        ttk.Label(config_card, text="认证方式").grid(row=2, column=0, sticky=W, padx=(0, 8), pady=6)
-        auth_frame = ttk.Frame(config_card)
-        auth_frame.grid(row=2, column=1, columnspan=3, sticky="w", pady=6)
+        ttk.Label(config_card, text="认证方式").grid(row=3, column=0, sticky=W, padx=(0, 8), pady=6)
+        self.auth_frame = ttk.Frame(config_card)
+        self.auth_frame.grid(row=3, column=1, columnspan=3, sticky="w", pady=6)
 
         ttk.Radiobutton(
-            auth_frame,
+            self.auth_frame,
             text="Windows 认证",
             value="windows",
             variable=self.auth_mode_var,
             command=self.toggle_auth_mode,
         ).pack(side=LEFT)
         ttk.Radiobutton(
-            auth_frame,
+            self.auth_frame,
             text="SQL Server 认证",
             value="sql",
             variable=self.auth_mode_var,
             command=self.toggle_auth_mode,
         ).pack(side=LEFT, padx=(12, 0))
 
-        ttk.Label(config_card, text="用户名").grid(row=3, column=0, sticky=W, padx=(0, 8), pady=6)
+        ttk.Label(config_card, text="用户名").grid(row=4, column=0, sticky=W, padx=(0, 8), pady=6)
         self.username_entry = ttk.Entry(config_card, textvariable=self.username_var)
-        self.username_entry.grid(row=3, column=1, sticky="ew", pady=6)
+        self.username_entry.grid(row=4, column=1, sticky="ew", pady=6)
 
-        ttk.Label(config_card, text="密码").grid(row=3, column=2, sticky=W, padx=(12, 8), pady=6)
+        ttk.Label(config_card, text="密码").grid(row=4, column=2, sticky=W, padx=(12, 8), pady=6)
         self.password_entry = ttk.Entry(config_card, textvariable=self.password_var, show="*")
-        self.password_entry.grid(row=3, column=3, sticky="ew", pady=6)
+        self.password_entry.grid(row=4, column=3, sticky="ew", pady=6)
+
+        self.db_type_hint_label = ttk.Label(config_card, text="", foreground="#666666")
+        self.db_type_hint_label.grid(row=5, column=0, columnspan=4, sticky=W, pady=(8, 0))
 
         backup_card = ttk.LabelFrame(body, text="备份配置", padding=16)
         backup_card.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(16, 0))
@@ -211,7 +244,7 @@ class SqlServerBackupApp:
 
         ttk.Label(
             backup_card,
-            text="留空时自动生成：数据库名_YYYYMMDD_HHMMSS.bak",
+            text="留空时自动生成：数据库名_YYYYMMDD_HHMMSS.bak / .sql",
             foreground="#666666",
         ).grid(row=2, column=0, columnspan=3, sticky=W, pady=(4, 12))
 
@@ -312,7 +345,7 @@ class SqlServerBackupApp:
         ttk.Separator(status_bar, orient="horizontal").grid(row=0, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(status_bar, textvariable=self.status_var).grid(row=1, column=0, sticky="w")
 
-        self.toggle_auth_mode()
+        self.toggle_db_type()
         self.toggle_schedule_mode()
 
     def choose_backup_dir(self) -> None:
@@ -336,11 +369,30 @@ class SqlServerBackupApp:
         self.status_var.set("日志已清空")
 
     def toggle_auth_mode(self) -> None:
-        state = "normal" if self.auth_mode_var.get() == "sql" else "disabled"
+        state = "normal" if self.db_type_var.get() == "mysql" or self.auth_mode_var.get() == "sql" else "disabled"
         if self.username_entry is not None:
             self.username_entry.configure(state=state)
         if self.password_entry is not None:
             self.password_entry.configure(state=state)
+
+    def toggle_db_type(self) -> None:
+        db_type = self.db_type_var.get()
+        if db_type == "mysql":
+            if self.port_var.get() in {"", "1433"}:
+                self.port_var.set("3306")
+            self.auth_mode_var.set("sql")
+            hint = "MySQL 备份依赖 mysqldump，请确保 MySQL 客户端工具已安装并加入 PATH。"
+        else:
+            if self.port_var.get() in {"", "3306"}:
+                self.port_var.set("1433")
+            hint = "SQL Server 备份依赖 SQL Server ODBC Driver 17/18。"
+
+        if self.auth_frame is not None:
+            for child in self.auth_frame.winfo_children():
+                child.configure(state="disabled" if db_type == "mysql" else "normal")
+        if self.db_type_hint_label is not None:
+            self.db_type_hint_label.configure(text=hint)
+        self.toggle_auth_mode()
 
     def toggle_schedule_mode(self) -> None:
         enabled = self.schedule_enabled_var.get()
@@ -359,7 +411,9 @@ class SqlServerBackupApp:
                 self.log("未找到配置文件，已加载默认配置。")
             return
         try:
-            config = AppConfig(**json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+            saved_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            saved_config.setdefault("db_type", "sqlserver")
+            config = AppConfig(**saved_config)
             self.apply_config(config)
             if not auto:
                 self.log(f"已加载配置文件：{CONFIG_FILE}")
@@ -382,11 +436,13 @@ class SqlServerBackupApp:
             messagebox.showerror("保存失败", f"无法保存配置文件：\n{exc}")
 
     def collect_config(self, validate: bool = True) -> AppConfig:
+        db_type = self.db_type_var.get()
         config = AppConfig(
+            db_type=db_type,
             server=self.server_var.get().strip(),
-            port=self.port_var.get().strip() or "1433",
+            port=self.port_var.get().strip() or ("3306" if db_type == "mysql" else "1433"),
             database=self.database_var.get().strip(),
-            auth_mode=self.auth_mode_var.get(),
+            auth_mode="sql" if db_type == "mysql" else self.auth_mode_var.get(),
             username=self.username_var.get().strip(),
             password=self.password_var.get(),
             backup_dir=self.backup_dir_var.get().strip(),
@@ -402,10 +458,12 @@ class SqlServerBackupApp:
         )
         if validate:
             if not config.server:
-                raise ValueError("请填写 SQL Server 服务器地址。")
+                raise ValueError("请填写服务器/主机地址。")
             if not config.port.isdigit():
                 raise ValueError("端口必须是数字。")
-            if config.auth_mode == "sql" and (not config.username or not config.password):
+            if config.db_type == "mysql" and not config.username:
+                raise ValueError("MySQL 需要填写用户名。")
+            if config.db_type == "sqlserver" and config.auth_mode == "sql" and (not config.username or not config.password):
                 raise ValueError("SQL Server 认证需要填写用户名和密码。")
             if not config.backup_dir:
                 raise ValueError("请填写备份目录。")
@@ -428,6 +486,7 @@ class SqlServerBackupApp:
                 raise ValueError("间隔分钟必须大于 0。")
 
     def apply_config(self, config: AppConfig) -> None:
+        self.db_type_var.set(config.db_type)
         self.server_var.set(config.server)
         self.port_var.set(config.port)
         self.database_var.set(config.database)
@@ -444,7 +503,7 @@ class SqlServerBackupApp:
         self.start_with_windows_var.set(config.start_with_windows)
         self.tray_notifications_var.set(config.tray_notifications)
         self.startup_minimized_var.set(config.startup_minimized)
-        self.toggle_auth_mode()
+        self.toggle_db_type()
         self.toggle_schedule_mode()
 
     def should_start_minimized(self) -> bool:
@@ -486,6 +545,25 @@ class SqlServerBackupApp:
             raise RuntimeError("未找到 SQL Server ODBC 驱动。当前可用驱动：" + ", ".join(available_drivers))
         raise RuntimeError("未检测到任何 ODBC 驱动，请先安装 SQL Server 或 SQL Server ODBC Driver 17/18。")
 
+    def connect_mysql(self, config: AppConfig, database_override: str | None = None):
+        if pymysql is None:
+            raise RuntimeError("未安装 PyMySQL，请先执行 `pip install -r requirements.txt`。")
+        return pymysql.connect(
+            host=config.server,
+            port=int(config.port),
+            user=config.username,
+            password=config.password,
+            database=database_override,
+            connect_timeout=5,
+            charset="utf8mb4",
+        )
+
+    def get_mysqldump_path(self) -> str:
+        mysqldump_path = shutil.which("mysqldump")
+        if not mysqldump_path:
+            raise RuntimeError("未找到 mysqldump，请安装 MySQL 客户端工具并将其加入 PATH。")
+        return mysqldump_path
+
     def set_busy(self, busy: bool, status: str) -> None:
         self.is_busy = busy
         self.status_var.set(status)
@@ -518,13 +596,22 @@ class SqlServerBackupApp:
 
         def job() -> None:
             self.log("开始测试数据库连接...")
-            connection_string = self.build_connection_string(config, database_override=config.database or "master")
-            with pyodbc.connect(connection_string, timeout=5) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT @@SERVERNAME, DB_NAME()")
-                server_name, database_name = cursor.fetchone()
-                self.log(f"连接成功。服务器：{server_name}，数据库：{database_name}")
-                self.notify("连接成功", f"已成功连接到数据库：{database_name}")
+            if config.db_type == "mysql":
+                with self.connect_mysql(config, database_override=config.database or None) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT @@hostname, DATABASE()")
+                        server_name, database_name = cursor.fetchone()
+                database_name = database_name or "(未选择数据库)"
+                self.log(f"MySQL 连接成功。服务器：{server_name}，数据库：{database_name}")
+                self.notify("连接成功", f"已成功连接到 MySQL：{database_name}")
+            else:
+                connection_string = self.build_connection_string(config, database_override=config.database or "master")
+                with pyodbc.connect(connection_string, timeout=5) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT @@SERVERNAME, DB_NAME()")
+                    server_name, database_name = cursor.fetchone()
+                    self.log(f"SQL Server 连接成功。服务器：{server_name}，数据库：{database_name}")
+                    self.notify("连接成功", f"已成功连接到数据库：{database_name}")
 
         self.run_async("连接测试", job)
 
@@ -535,7 +622,9 @@ class SqlServerBackupApp:
                 raise ValueError("请先填写服务器地址。")
             if not config.port.isdigit():
                 raise ValueError("端口必须是数字。")
-            if config.auth_mode == "sql" and (not config.username or not config.password):
+            if config.db_type == "mysql" and not config.username:
+                raise ValueError("MySQL 需要填写用户名。")
+            if config.db_type == "sqlserver" and config.auth_mode == "sql" and (not config.username or not config.password):
                 raise ValueError("SQL Server 认证需要填写用户名和密码。")
         except Exception as exc:
             messagebox.showwarning("配置不完整", str(exc))
@@ -543,23 +632,31 @@ class SqlServerBackupApp:
 
         def job() -> None:
             self.log("正在读取数据库列表...")
-            connection_string = self.build_connection_string(config, database_override="master")
-            with pyodbc.connect(connection_string, timeout=5) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT name
-                    FROM sys.databases
-                    WHERE name NOT IN ('tempdb')
-                    ORDER BY name
-                    """
-                )
-                databases = [row[0] for row in cursor.fetchall()]
-                self.root.after(0, lambda: self.database_combo.configure(values=databases))
-                if databases and not self.database_var.get():
-                    self.root.after(0, lambda: self.database_var.set(databases[0]))
-                self.log(f"已读取到 {len(databases)} 个数据库。")
-                self.notify("数据库列表已更新", f"已读取到 {len(databases)} 个数据库")
+            if config.db_type == "mysql":
+                with self.connect_mysql(config) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SHOW DATABASES")
+                        system_schemas = {"information_schema", "mysql", "performance_schema", "sys"}
+                        databases = [row[0] for row in cursor.fetchall() if row[0] not in system_schemas]
+            else:
+                connection_string = self.build_connection_string(config, database_override="master")
+                with pyodbc.connect(connection_string, timeout=5) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT name
+                        FROM sys.databases
+                        WHERE name NOT IN ('tempdb')
+                        ORDER BY name
+                        """
+                    )
+                    databases = [row[0] for row in cursor.fetchall()]
+
+            self.root.after(0, lambda: self.database_combo.configure(values=databases))
+            if databases and not self.database_var.get():
+                self.root.after(0, lambda: self.database_var.set(databases[0]))
+            self.log(f"已读取到 {len(databases)} 个数据库。")
+            self.notify("数据库列表已更新", f"已读取到 {len(databases)} 个数据库")
 
         self.run_async("读取数据库", job)
 
@@ -575,6 +672,12 @@ class SqlServerBackupApp:
         self.run_async("数据库备份", lambda: self.perform_backup(config, source="manual", show_message=True))
 
     def perform_backup(self, config: AppConfig, source: str, show_message: bool) -> None:
+        if config.db_type == "mysql":
+            self.perform_mysql_backup(config, source, show_message)
+            return
+        self.perform_sqlserver_backup(config, source, show_message)
+
+    def perform_sqlserver_backup(self, config: AppConfig, source: str, show_message: bool) -> None:
         backup_dir = Path(config.backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -600,6 +703,63 @@ class SqlServerBackupApp:
             cursor.execute(sql)
             while cursor.nextset():
                 pass
+
+        self.log(f"备份完成：{backup_file}")
+        self.notify("备份完成", f"{config.database} 已备份到 {backup_file.name}")
+        if show_message and not self.is_hidden_to_tray:
+            self.root.after(0, lambda: messagebox.showinfo("备份完成", f"数据库 {config.database} 已成功备份到：\n{backup_file}"))
+
+    def perform_mysql_backup(self, config: AppConfig, source: str, show_message: bool) -> None:
+        backup_dir = Path(config.backup_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = config.backup_name or f"{config.database}_{timestamp}.sql"
+        if not file_name.lower().endswith(".sql"):
+            file_name = f"{file_name}.sql"
+
+        backup_file = backup_dir / file_name
+        self.log(f"{'定时任务触发备份' if source == 'schedule' else '开始备份数据库'}：{config.database}")
+        self.log(f"备份文件：{backup_file}")
+
+        command = [
+            self.get_mysqldump_path(),
+            "--host",
+            config.server,
+            "--port",
+            config.port,
+            "--user",
+            config.username,
+            "--single-transaction",
+            "--routines",
+            "--triggers",
+            "--events",
+            "--databases",
+            config.database,
+        ]
+        env = None
+        if config.password:
+            env = dict(os.environ, MYSQL_PWD=config.password)
+
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        with backup_file.open("w", encoding="utf-8", newline="\n") as output_file:
+            result = subprocess.run(
+                command,
+                stdout=output_file,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                check=False,
+                creationflags=creationflags,
+            )
+        if result.returncode != 0:
+            try:
+                backup_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            error_text = result.stderr.strip() or f"mysqldump 退出码：{result.returncode}"
+            raise RuntimeError(error_text)
 
         self.log(f"备份完成：{backup_file}")
         self.notify("备份完成", f"{config.database} 已备份到 {backup_file.name}")
@@ -654,7 +814,13 @@ class SqlServerBackupApp:
             raise ValueError("服务器地址未填写。")
         if not config.port.isdigit():
             raise ValueError("端口不是有效数字。")
-        if config.auth_mode == "sql" and (not config.username or not config.password):
+        if config.db_type == "mysql" and not config.username:
+            raise ValueError("MySQL 用户名未填写。")
+        if config.db_type == "mysql" and not config.database:
+            raise ValueError("未选择要备份的 MySQL 数据库。")
+        if config.db_type == "mysql" and not shutil.which("mysqldump"):
+            raise ValueError("未找到 mysqldump，请先安装 MySQL 客户端工具。")
+        if config.db_type == "sqlserver" and config.auth_mode == "sql" and (not config.username or not config.password):
             raise ValueError("SQL Server 认证缺少用户名或密码。")
         if not config.database:
             raise ValueError("未选择要备份的数据库。")
@@ -687,7 +853,7 @@ class SqlServerBackupApp:
             pystray.MenuItem("立即备份", self.on_tray_backup),
             pystray.MenuItem("退出程序", self.on_tray_exit),
         )
-        self.tray_icon = pystray.Icon(APP_NAME, image, "SQL Server 备份工具", menu)
+        self.tray_icon = pystray.Icon(APP_NAME, image, "数据库备份工具", menu)
         self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
         self.tray_thread.start()
 
@@ -728,7 +894,7 @@ class SqlServerBackupApp:
             self.log("程序已最小化到系统托盘，可在托盘菜单中恢复窗口或退出。")
             self.tray_hint_shown = True
         if notify:
-            self.notify("程序正在后台运行", "SQL Server 备份工具已最小化到系统托盘")
+            self.notify("程序正在后台运行", "数据库备份工具已最小化到系统托盘")
 
     def show_from_tray(self) -> None:
         self.is_hidden_to_tray = False
