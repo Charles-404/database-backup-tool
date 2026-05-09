@@ -90,7 +90,7 @@ build_exe.bat
 
 ```bash
 pip install -r requirements.txt
-pyinstaller --clean --noconfirm sql_backup_tool.spec
+python -m PyInstaller --clean --noconfirm sql_backup_tool.spec
 ```
 
 生成后的可执行文件位于：
