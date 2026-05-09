@@ -7,7 +7,7 @@ import sys
 import threading
 import winreg
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import END, LEFT, W, filedialog, messagebox, StringVar
 import tkinter as tk
@@ -67,6 +67,7 @@ class AppConfig:
     password: str = ""
     backup_dir: str = str(BASE_DIR / "backups")
     backup_name: str = ""
+    retention_days: str = "30"
     schedule_enabled: bool = False
     schedule_type: str = "daily"
     schedule_time: str = "02:00"
@@ -89,6 +90,7 @@ class SqlServerBackupApp:
         self.is_busy = False
         self.scheduler_stop_event = threading.Event()
         self.last_schedule_key: str | None = None
+        self.last_cleanup_key: str | None = None
         self.tray_icon = None
         self.tray_thread = None
         self.tray_available = pystray is not None and Image is not None and ImageDraw is not None
@@ -105,6 +107,7 @@ class SqlServerBackupApp:
         self.password_var = StringVar()
         self.backup_dir_var = StringVar()
         self.backup_name_var = StringVar()
+        self.retention_days_var = StringVar(value="30")
         self.schedule_enabled_var = tk.BooleanVar(value=False)
         self.schedule_type_var = StringVar(value="daily")
         self.schedule_time_var = StringVar(value="02:00")
@@ -242,14 +245,20 @@ class SqlServerBackupApp:
         ttk.Label(backup_card, text="备份文件名").grid(row=1, column=0, sticky=W, padx=(0, 8), pady=6)
         ttk.Entry(backup_card, textvariable=self.backup_name_var).grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
 
+        ttk.Label(backup_card, text="保留天数").grid(row=2, column=0, sticky=W, padx=(0, 8), pady=6)
+        ttk.Entry(backup_card, textvariable=self.retention_days_var).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Label(backup_card, text="0 表示不自动清理", foreground="#666666").grid(
+            row=2, column=2, sticky=W, padx=(12, 0), pady=6
+        )
+
         ttk.Label(
             backup_card,
             text="留空时自动生成：数据库名_YYYYMMDD_HHMMSS.bak / .sql",
             foreground="#666666",
-        ).grid(row=2, column=0, columnspan=3, sticky=W, pady=(4, 12))
+        ).grid(row=3, column=0, columnspan=3, sticky=W, pady=(4, 12))
 
         action_frame = ttk.Frame(backup_card)
-        action_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        action_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         for column in range(4):
             action_frame.columnconfigure(column, weight=1)
 
@@ -413,6 +422,7 @@ class SqlServerBackupApp:
         try:
             saved_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             saved_config.setdefault("db_type", "sqlserver")
+            saved_config.setdefault("retention_days", "30")
             config = AppConfig(**saved_config)
             self.apply_config(config)
             if not auto:
@@ -426,6 +436,7 @@ class SqlServerBackupApp:
     def save_config(self) -> None:
         try:
             config = self.collect_config(validate=False)
+            self.validate_retention_config(config)
             self.validate_schedule_config(config)
             CONFIG_FILE.write_text(json.dumps(asdict(config), ensure_ascii=False, indent=2), encoding="utf-8")
             self.sync_startup_state(show_message=False)
@@ -447,6 +458,7 @@ class SqlServerBackupApp:
             password=self.password_var.get(),
             backup_dir=self.backup_dir_var.get().strip(),
             backup_name=self.backup_name_var.get().strip(),
+            retention_days=self.retention_days_var.get().strip() or "0",
             schedule_enabled=bool(self.schedule_enabled_var.get()),
             schedule_type=self.schedule_type_var.get(),
             schedule_time=self.schedule_time_var.get().strip(),
@@ -467,7 +479,13 @@ class SqlServerBackupApp:
                 raise ValueError("SQL Server 认证需要填写用户名和密码。")
             if not config.backup_dir:
                 raise ValueError("请填写备份目录。")
+        if validate:
+            self.validate_retention_config(config)
         return config
+
+    def validate_retention_config(self, config: AppConfig) -> None:
+        if not config.retention_days.isdigit():
+            raise ValueError("备份保留天数必须是数字。")
 
     def validate_schedule_config(self, config: AppConfig) -> None:
         if not config.schedule_enabled:
@@ -495,6 +513,7 @@ class SqlServerBackupApp:
         self.password_var.set(config.password)
         self.backup_dir_var.set(config.backup_dir)
         self.backup_name_var.set(config.backup_name)
+        self.retention_days_var.set(config.retention_days)
         self.schedule_enabled_var.set(config.schedule_enabled)
         self.schedule_type_var.set(config.schedule_type)
         self.schedule_time_var.set(config.schedule_time)
@@ -674,8 +693,9 @@ class SqlServerBackupApp:
     def perform_backup(self, config: AppConfig, source: str, show_message: bool) -> None:
         if config.db_type == "mysql":
             self.perform_mysql_backup(config, source, show_message)
-            return
-        self.perform_sqlserver_backup(config, source, show_message)
+        else:
+            self.perform_sqlserver_backup(config, source, show_message)
+        self.cleanup_old_backups(config)
 
     def perform_sqlserver_backup(self, config: AppConfig, source: str, show_message: bool) -> None:
         backup_dir = Path(config.backup_dir)
@@ -766,17 +786,81 @@ class SqlServerBackupApp:
         if show_message and not self.is_hidden_to_tray:
             self.root.after(0, lambda: messagebox.showinfo("备份完成", f"数据库 {config.database} 已成功备份到：\n{backup_file}"))
 
+    def cleanup_old_backups(self, config: AppConfig) -> int:
+        if not config.retention_days.isdigit():
+            return 0
+        retention_days = int(config.retention_days)
+        if retention_days <= 0:
+            return 0
+
+        backup_dir = Path(config.backup_dir)
+        if not backup_dir.exists():
+            return 0
+
+        cutoff = datetime.now() - timedelta(days=retention_days)
+        removable_suffixes = {".bak", ".sql"}
+        removed_count = 0
+        removed_names: list[str] = []
+
+        for file_path in backup_dir.iterdir():
+            if not file_path.is_file() or file_path.suffix.lower() not in removable_suffixes:
+                continue
+            try:
+                modified_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+            except OSError:
+                continue
+            if modified_time >= cutoff:
+                continue
+            try:
+                file_path.unlink()
+            except OSError as exc:
+                self.log(f"清理历史备份失败：{file_path.name}，{exc}")
+                continue
+            removed_count += 1
+            removed_names.append(file_path.name)
+
+        if removed_count:
+            self.log(
+                f"已清理 {removed_count} 个超过 {retention_days} 天的历史备份："
+                + ", ".join(removed_names)
+            )
+        else:
+            self.log(f"未发现超过 {retention_days} 天的历史备份文件")
+        return removed_count
+
     def start_scheduler(self) -> None:
         threading.Thread(target=self.scheduler_loop, daemon=True).start()
 
     def scheduler_loop(self) -> None:
         while not self.scheduler_stop_event.is_set():
             try:
+                self.check_retention_cleanup()
                 self.check_schedule()
             except Exception as exc:
                 self.log(f"定时任务检查失败：{exc}")
                 self.notify("定时任务检查失败", str(exc))
             self.scheduler_stop_event.wait(20)
+
+    def check_retention_cleanup(self) -> None:
+        if self.is_busy:
+            return
+        config = self.collect_config(validate=False)
+        try:
+            self.validate_retention_config(config)
+        except Exception as exc:
+            self.log(f"历史备份清理已跳过：{exc}")
+            return
+        if not config.backup_dir or int(config.retention_days) <= 0:
+            return
+
+        cleanup_key = f"{Path(config.backup_dir).resolve()}:{datetime.now().strftime('%Y-%m-%d')}"
+        if cleanup_key == self.last_cleanup_key:
+            return
+        self.last_cleanup_key = cleanup_key
+
+        removed_count = self.cleanup_old_backups(config)
+        if removed_count:
+            self.notify("历史备份已清理", f"已删除 {removed_count} 个超过 {config.retention_days} 天的备份文件")
 
     def check_schedule(self) -> None:
         if self.is_busy:
