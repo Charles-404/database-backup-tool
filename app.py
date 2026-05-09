@@ -50,6 +50,7 @@ def get_resource_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 CONFIG_FILE = BASE_DIR / "config.json"
+LOG_FILE = BASE_DIR / "logs" / "app.log"
 RESOURCE_DIR = get_resource_dir()
 ASSETS_DIR = RESOURCE_DIR / "assets"
 ICON_ICO_FILE = ASSETS_DIR / "app_icon.ico"
@@ -126,6 +127,7 @@ class SqlServerBackupApp:
         self.status_var = StringVar(value="就绪")
         self.db_type_hint_label: ttk.Label | None = None
         self.auth_frame: ttk.Frame | None = None
+        self.left_canvas: tk.Canvas | None = None
 
         self.build_ui()
         self.load_config(auto=True)
@@ -163,7 +165,6 @@ class SqlServerBackupApp:
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(1, weight=1)
-        body.rowconfigure(2, weight=1)
 
         config_card = ttk.LabelFrame(body, text="数据库配置", padding=16)
         config_card.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -232,8 +233,39 @@ class SqlServerBackupApp:
         self.db_type_hint_label = ttk.Label(config_card, text="", foreground="#666666")
         self.db_type_hint_label.grid(row=5, column=0, columnspan=4, sticky=W, pady=(8, 0))
 
-        backup_card = ttk.LabelFrame(body, text="备份配置", padding=16)
-        backup_card.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(16, 0))
+        left_shell = ttk.Frame(body)
+        left_shell.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(16, 0))
+        left_shell.columnconfigure(0, weight=1)
+        left_shell.rowconfigure(0, weight=1)
+
+        self.left_canvas = tk.Canvas(left_shell, highlightthickness=0, borderwidth=0)
+        left_scrollbar = ttk.Scrollbar(left_shell, orient="vertical", command=self.left_canvas.yview)
+        left_panel = ttk.Frame(self.left_canvas)
+        left_window = self.left_canvas.create_window((0, 0), window=left_panel, anchor="nw")
+        self.left_canvas.configure(yscrollcommand=left_scrollbar.set)
+        self.left_canvas.grid(row=0, column=0, sticky="nsew")
+        left_scrollbar.grid(row=0, column=1, sticky="ns")
+        left_panel.columnconfigure(0, weight=1)
+
+        def update_left_scroll_region(_event: tk.Event) -> None:
+            if self.left_canvas is not None:
+                self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+
+        def update_left_panel_width(event: tk.Event) -> None:
+            if self.left_canvas is not None:
+                self.left_canvas.itemconfigure(left_window, width=event.width)
+
+        def scroll_left_panel(event: tk.Event) -> str:
+            if self.left_canvas is not None:
+                self.left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        left_panel.bind("<Configure>", update_left_scroll_region)
+        self.left_canvas.bind("<Configure>", update_left_panel_width)
+        self.left_canvas.bind("<MouseWheel>", scroll_left_panel)
+
+        backup_card = ttk.LabelFrame(left_panel, text="备份配置", padding=16)
+        backup_card.grid(row=0, column=0, sticky="nsew")
         backup_card.columnconfigure(1, weight=1)
 
         ttk.Label(backup_card, text="备份目录").grid(row=0, column=0, sticky=W, padx=(0, 8), pady=6)
@@ -267,8 +299,8 @@ class SqlServerBackupApp:
         ttk.Button(action_frame, text="开始备份", command=self.start_backup).grid(row=0, column=2, sticky="ew", padx=6)
         ttk.Button(action_frame, text="最小化到托盘", command=self.hide_to_tray).grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
-        schedule_card = ttk.LabelFrame(body, text="定时与后台", padding=16)
-        schedule_card.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(16, 0))
+        schedule_card = ttk.LabelFrame(left_panel, text="定时与后台", padding=16)
+        schedule_card.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
         schedule_card.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
@@ -337,8 +369,15 @@ class SqlServerBackupApp:
             foreground="#666666",
         ).grid(row=8, column=0, columnspan=3, sticky=W, pady=(8, 0))
 
+        def bind_left_mousewheel(widget: tk.Widget) -> None:
+            widget.bind("<MouseWheel>", scroll_left_panel)
+            for child in widget.winfo_children():
+                bind_left_mousewheel(child)
+
+        bind_left_mousewheel(left_panel)
+
         log_card = ttk.LabelFrame(body, text="运行日志", padding=16)
-        log_card.grid(row=1, column=1, rowspan=2, sticky="nsew", padx=(8, 0), pady=(16, 0))
+        log_card.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(16, 0))
         log_card.columnconfigure(0, weight=1)
         log_card.rowconfigure(0, weight=1)
 
@@ -375,6 +414,11 @@ class SqlServerBackupApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", END)
         self.log_text.configure(state="disabled")
+        try:
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            LOG_FILE.write_text("", encoding="utf-8")
+        except Exception:
+            pass
         self.status_var.set("日志已清空")
 
     def toggle_auth_mode(self) -> None:
@@ -1065,12 +1109,21 @@ class SqlServerBackupApp:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.log_queue.put(f"[{timestamp}] {message}")
 
+    def write_log_file(self, message: str) -> None:
+        try:
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with LOG_FILE.open("a", encoding="utf-8") as log_file:
+                log_file.write(message + "\n")
+        except Exception:
+            pass
+
     def process_log_queue(self) -> None:
         if self.is_exiting:
             return
         if self.log_text is not None:
             while not self.log_queue.empty():
                 msg = self.log_queue.get_nowait()
+                self.write_log_file(msg)
                 self.log_text.configure(state="normal")
                 self.log_text.insert(END, msg + "\n")
                 self.log_text.see(END)
