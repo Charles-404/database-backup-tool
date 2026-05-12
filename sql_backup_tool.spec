@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
     datas=[('assets', 'assets')],
-    hiddenimports=['pystray._win32'],
+    hiddenimports=['pystray._win32', *collect_submodules('cryptography')],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
